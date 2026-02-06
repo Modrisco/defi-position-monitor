@@ -51,3 +51,14 @@ PYTH_PRICE_FEEDS = {
     "USDT": "2b89b9dc8fdf9f34709a5b106b472f0f39bb6ca9ce04b0fd7f2e971688e2e53b",
     "ETH": "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
 }
+
+# Token decimals (standard values)
+TOKEN_DECIMALS = {
+    "SUI": 9,
+    "USDC": 6,
+    "USDT": 6,
+    "BTC": 8,
+    "XBTC": 8,
+    "ETH": 8,
+    "WETH": 8,
+}

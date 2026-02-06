@@ -5,7 +5,7 @@ from ..config import (
     ALPHALEND_PACKAGE_ID,
     POSITIONS_TABLE_ID,
     MARKETS_TABLE_ID,
-    USD_PRECISION,
+    TOKEN_DECIMALS,
 )
 from ..models import PositionData
 from ..rpc import SuiClient
@@ -16,6 +16,8 @@ class PositionService:
 
     def __init__(self, sui_client: SuiClient):
         self.sui_client = sui_client
+        # Cache market info to avoid repeated fetches
+        self._market_cache: Dict[int, Dict] = {}
 
     async def get_position_capabilities(self, wallet_address: str) -> List[str]:
         """Find position capability objects for AlphaLend"""
@@ -60,7 +62,10 @@ class PositionService:
             return {}
 
     async def get_market_info(self, market_id: int) -> Dict:
-        """Fetch market info to get coin type and decimals"""
+        """Fetch market info to get coin type (with caching)"""
+        if market_id in self._market_cache:
+            return self._market_cache[market_id]
+
         try:
             result = await self.sui_client.get_dynamic_field_object(
                 MARKETS_TABLE_ID,
@@ -75,13 +80,26 @@ class PositionService:
             fields = content.get("fields", {})
             market = fields.get("value", {}).get("fields", {})
 
+            self._market_cache[market_id] = market
             return market
         except Exception as e:
             print(f"Error fetching market {market_id}: {e}")
             return {}
 
-    async def fetch_positions(self, wallet_address: str) -> List[PositionData]:
-        """Fetch all lending positions for a wallet"""
+    def _get_token_symbol(self, coin_type: str) -> str:
+        """Extract token symbol from coin type string"""
+        if "::" in coin_type:
+            return coin_type.split("::")[-1].upper()
+        return coin_type.upper()
+
+    def _get_decimals(self, token_symbol: str) -> int:
+        """Get token decimals from config"""
+        return TOKEN_DECIMALS.get(token_symbol, 9)  # Default to 9 (SUI standard)
+
+    async def fetch_positions(
+        self, wallet_address: str, prices: Dict[str, float]
+    ) -> List[PositionData]:
+        """Fetch all lending positions for a wallet with real-time price calculation"""
         print(f"Checking positions for wallet: {wallet_address}")
 
         position_caps = await self.get_position_capabilities(wallet_address)
@@ -106,91 +124,130 @@ class PositionService:
                 print(f"  Could not fetch position data")
                 continue
 
-            position = await self._parse_position_data(position_data, position_id)
+            position = await self._parse_position_data(position_data, position_id, prices)
             if position:
                 positions.append(position)
 
         return positions
 
     async def _parse_position_data(
-        self, position_data: Dict, position_id: str
+        self, position_data: Dict, position_id: str, prices: Dict[str, float]
     ) -> PositionData:
-        """Parse raw position data into PositionData object"""
-        # Extract USD values (stored with 18 decimal precision)
-        total_collateral_usd_raw = int(
-            position_data.get("total_collateral_usd", {})
-            .get("fields", {})
-            .get("value", "0")
-        )
-        total_loan_usd_raw = int(
-            position_data.get("total_loan_usd", {})
-            .get("fields", {})
-            .get("value", "0")
-        )
-        liquidation_value_raw = int(
-            position_data.get("liquidation_value", {})
-            .get("fields", {})
-            .get("value", "0")
-        )
-        safe_collateral_usd_raw = int(
-            position_data.get("safe_collateral_usd", {})
-            .get("fields", {})
-            .get("value", "0")
-        )
+        """Parse raw position data into PositionData object with real-time prices"""
 
-        # Convert to actual USD values
-        total_collateral_usd = total_collateral_usd_raw / USD_PRECISION
-        total_loan_usd = total_loan_usd_raw / USD_PRECISION
-        liquidation_value = liquidation_value_raw / USD_PRECISION
-        safe_collateral_usd = safe_collateral_usd_raw / USD_PRECISION
+        # Parse collaterals with real-time price calculation
+        # Note: collaterals are stored as shares (xtokens), need to multiply by xtoken_ratio
+        collaterals = position_data.get("collaterals", {}).get("fields", {}).get("contents", [])
+        collateral_details = []
+        total_collateral_usd = 0.0
+
+        for c in collaterals:
+            market_id = int(c.get("fields", {}).get("key", 0))
+            shares = int(c.get("fields", {}).get("value", 0))
+
+            market_info = await self.get_market_info(market_id)
+            coin_type = market_info.get("coin_type", {}).get("fields", {}).get("name", "Unknown")
+            token_symbol = self._get_token_symbol(coin_type)
+            decimals = self._get_decimals(token_symbol)
+
+            # Get xtoken_ratio to convert shares to actual tokens
+            xtoken_ratio_raw = market_info.get("xtoken_ratio", 10**18)
+            if isinstance(xtoken_ratio_raw, dict):
+                xtoken_ratio = int(xtoken_ratio_raw.get("fields", {}).get("value", 10**18))
+            else:
+                xtoken_ratio = int(xtoken_ratio_raw)
+
+            # Actual amount = shares × xtoken_ratio / 10^18 / 10^decimals
+            amount = (shares * xtoken_ratio) / (10**18) / (10**decimals)
+
+            # Get price (try exact match, then common aliases)
+            price = prices.get(token_symbol, 0)
+            if price == 0 and token_symbol == "XBTC":
+                price = prices.get("BTC", 0)
+
+            usd_value = amount * price
+            total_collateral_usd += usd_value
+
+            collateral_details.append({
+                "symbol": token_symbol,
+                "market_id": market_id,
+                "amount": amount,
+                "price": price,
+                "usd_value": usd_value
+            })
+
+        # Parse loans with real-time price calculation
+        # Note: loan amount is the actual borrowed amount (not shares)
+        loans = position_data.get("loans", [])
+        loan_details = []
+        total_loan_usd = 0.0
+
+        for loan in loans:
+            loan_fields = loan.get("fields", {})
+            raw_amount = int(loan_fields.get("amount", 0))
+
+            coin_type = loan_fields.get("coin_type", {}).get("fields", {}).get("name", "Unknown")
+            token_symbol = self._get_token_symbol(coin_type)
+            decimals = self._get_decimals(token_symbol)
+
+            # Convert raw amount to actual amount
+            amount = raw_amount / (10**decimals)
+
+            # Get price
+            price = prices.get(token_symbol, 0)
+
+            usd_value = amount * price
+            total_loan_usd += usd_value
+
+            loan_details.append({
+                "symbol": token_symbol,
+                "amount": amount,
+                "price": price,
+                "usd_value": usd_value
+            })
 
         # Calculate LTV and health factor
         ltv = (total_loan_usd / total_collateral_usd * 100) if total_collateral_usd > 0 else 0
-        health_factor = (liquidation_value / total_loan_usd) if total_loan_usd > 0 else float('inf')
 
-        # Get position health status
+        # For liquidation threshold, use the on-chain value as reference
+        # Typically around 85-90% for most assets
+        liquidation_threshold = 85.0  # Default, could be made per-asset
+
+        # Health factor = (collateral * liquidation_threshold) / borrowed
+        health_factor = (
+            (total_collateral_usd * liquidation_threshold / 100) / total_loan_usd
+            if total_loan_usd > 0
+            else float('inf')
+        )
+
+        # Get position health status from on-chain data
         is_healthy = position_data.get("is_position_healthy", True)
         is_liquidatable = position_data.get("is_position_liquidatable", False)
 
-        # Parse collaterals and loans
-        collaterals = position_data.get("collaterals", {}).get("fields", {}).get("contents", [])
-        loans = position_data.get("loans", [])
-
-        # Build collateral summary
-        collateral_summary = []
-        for c in collaterals:
-            market_id = int(c.get("fields", {}).get("key", 0))
-            market_info = await self.get_market_info(market_id)
-            coin_type = market_info.get("coin_type", {}).get("fields", {}).get("name", "Unknown")
-            token_symbol = coin_type.split("::")[-1] if "::" in coin_type else coin_type
-            collateral_summary.append(f"{token_symbol} (market {market_id})")
-
-        # Build loan summary
-        loan_summary = []
-        for loan in loans:
-            loan_fields = loan.get("fields", {})
-            coin_type = loan_fields.get("coin_type", {}).get("fields", {}).get("name", "Unknown")
-            token_symbol = coin_type.split("::")[-1] if "::" in coin_type else coin_type
-            loan_summary.append(f"{token_symbol}")
-
-        # Calculate liquidation threshold
-        liquidation_threshold = (
-            (liquidation_value / total_collateral_usd * 100)
-            if total_collateral_usd > 0
-            else 0
-        )
+        # Build summaries for display
+        collateral_summary = [
+            f"{d['symbol']} ({d['amount']:.4f} @ ${d['price']:,.2f})"
+            for d in collateral_details
+        ]
+        loan_summary = [
+            f"{d['symbol']} ({d['amount']:.4f} @ ${d['price']:,.2f})"
+            for d in loan_details
+        ]
 
         # Print detailed position info
         print(f"\n{'='*60}")
-        print(f"POSITION SUMMARY")
+        print(f"POSITION SUMMARY (Real-time prices)")
         print(f"{'='*60}")
         print(f"  Position ID: {position_id}")
-        print(f"  Collateral Assets: {', '.join(collateral_summary) if collateral_summary else 'N/A'}")
-        print(f"  Borrowed Assets: {', '.join(loan_summary) if loan_summary else 'N/A'}")
         print(f"  ")
+        print(f"  Collateral Assets:")
+        for d in collateral_details:
+            print(f"    - {d['symbol']}: {d['amount']:.6f} × ${d['price']:,.2f} = ${d['usd_value']:,.2f}")
         print(f"  Total Collateral:     ${total_collateral_usd:,.2f}")
-        print(f"  Safe Collateral:      ${safe_collateral_usd:,.2f}")
-        print(f"  Liquidation Value:    ${liquidation_value:,.2f}")
+        print(f"  ")
+        print(f"  Borrowed Assets:")
+        for d in loan_details:
+            print(f"    - {d['symbol']}: {d['amount']:.6f} × ${d['price']:,.2f} = ${d['usd_value']:,.2f}")
         print(f"  Total Borrowed:       ${total_loan_usd:,.2f}")
         print(f"  ")
         print(f"  LTV:                  {ltv:.2f}%")

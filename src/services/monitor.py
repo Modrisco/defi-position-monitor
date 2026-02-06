@@ -113,11 +113,11 @@ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC
 
     async def check_and_alert(self):
         """Check positions, send logs, and send alerts if needed"""
-        # Fetch prices (for potential future use)
-        await self.price_service.fetch_prices()
+        # Fetch current prices from Pyth
+        prices = await self.price_service.fetch_prices()
 
-        # Fetch positions
-        positions = await self.position_service.fetch_positions(self.wallet_address)
+        # Fetch positions with real-time price calculation
+        positions = await self.position_service.fetch_positions(self.wallet_address, prices)
 
         if not positions:
             log_msg = f"""
@@ -156,7 +156,8 @@ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC
 
     async def generate_daily_report(self):
         """Generate daily position report"""
-        positions = await self.position_service.fetch_positions(self.wallet_address)
+        prices = await self.price_service.fetch_prices()
+        positions = await self.position_service.fetch_positions(self.wallet_address, prices)
 
         report = f"""
 📊 Daily Bluefin AlphaLend Report
