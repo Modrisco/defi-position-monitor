@@ -68,10 +68,10 @@ class BluefinMonitor:
         self.alert_email = alert_email
         self.ltv_warning_threshold = ltv_warning_threshold
         self.ltv_critical_threshold = ltv_critical_threshold
-        self.rpc_url = self.SUI_RPC_ENDPOINTS[0]
+        self.current_rpc_index = 0
         
     async def _rpc_call(self, method: str, params: List) -> Dict:
-        """Make RPC call to SUI node"""
+        """Make RPC call to SUI node with fallback to alternative endpoints"""
         payload = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -81,14 +81,36 @@ class BluefinMonitor:
 
         # Create SSL context using certifi's certificate bundle
         ssl_context = ssl.create_default_context(cafile=certifi.where())
-        connector = aiohttp.TCPConnector(ssl=ssl_context)
 
-        async with aiohttp.ClientSession(connector=connector) as session:
-            async with session.post(self.rpc_url, json=payload) as response:
-                result = await response.json()
-                if "error" in result:
-                    raise Exception(f"RPC Error: {result['error']}")
-                return result.get("result", {})
+        # Try each RPC endpoint starting from current index
+        last_error = None
+        for attempt in range(len(self.SUI_RPC_ENDPOINTS)):
+            rpc_index = (self.current_rpc_index + attempt) % len(self.SUI_RPC_ENDPOINTS)
+            rpc_url = self.SUI_RPC_ENDPOINTS[rpc_index]
+
+            try:
+                connector = aiohttp.TCPConnector(ssl=ssl_context)
+                async with aiohttp.ClientSession(connector=connector) as session:
+                    async with session.post(rpc_url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                        result = await response.json()
+                        if "error" in result:
+                            raise Exception(f"RPC Error: {result['error']}")
+
+                        # Success - update current index to use this endpoint first next time
+                        if rpc_index != self.current_rpc_index:
+                            print(f"Switched to RPC endpoint: {rpc_url}")
+                            self.current_rpc_index = rpc_index
+
+                        return result.get("result", {})
+            except Exception as e:
+                last_error = e
+                print(f"RPC endpoint {rpc_url} failed: {e}")
+                if attempt < len(self.SUI_RPC_ENDPOINTS) - 1:
+                    print(f"Trying next endpoint...")
+                continue
+
+        # All endpoints failed
+        raise Exception(f"All RPC endpoints failed. Last error: {last_error}")
     
     async def get_owned_objects(self) -> List[Dict]:
         """Get all objects owned by the wallet"""
