@@ -155,45 +155,41 @@ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC
                 await self.telegram.send_alert(alert_msg)
 
     async def generate_daily_report(self):
-        """Generate daily position report"""
+        """Generate and send daily position report via Telegram alert bot"""
         prices = await self.price_service.fetch_prices()
         positions = await self.position_service.fetch_positions(self.wallet_address, prices)
 
-        report = f"""
-📊 Daily Bluefin AlphaLend Report
-Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-Wallet: {self.wallet_address}
-
-{'='*50}
-"""
-
         if not positions:
-            report += "\nNo active positions found.\n"
-        else:
-            for i, position in enumerate(positions, 1):
-                status = "✅ Safe"
-                if position.ltv >= self.ltv_critical_threshold:
-                    status = "🚨 CRITICAL"
-                elif position.ltv >= self.ltv_warning_threshold:
-                    status = "⚠️ WARNING"
+            report = f"""
+📋 <b>Daily Bluefin AlphaLend Report</b>
 
-                report += f"""
-Position {i}: {status}
-  Collateral: ${position.collateral_value:.2f}
-  Borrowed: ${position.borrowed_value:.2f}
+No active positions found.
+
+Wallet: <code>{self._format_wallet()}</code>
+Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC
+            """
+        else:
+            position_lines = ""
+            for i, position in enumerate(positions, 1):
+                status = self._get_status(position.ltv)
+                position_lines += f"""
+<b>Position {i}:</b> {status}
+  Collateral: {position.asset} — ${position.collateral_value:,.2f}
+  Borrowed: {position.borrowed_asset} — ${position.borrowed_value:,.2f}
   LTV: {position.ltv:.2f}%
   Health Factor: {position.health_factor:.2f}
   Liquidation Threshold: {position.liquidation_threshold:.2f}%
 """
 
-        report += "\n" + "="*50
+            report = f"""
+📋 <b>Daily Bluefin AlphaLend Report</b>
+{position_lines}
+Wallet: <code>{self._format_wallet()}</code>
+Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC
+            """
 
-        await self.email.send_alert("📊 Daily Bluefin Position Report", report)
+        await self.telegram.send_alert(report)
         print(report)
-
-        # Save to file
-        with open(f"report_{datetime.now().strftime('%Y%m%d')}.txt", "w") as f:
-            f.write(report)
 
     async def run_continuous(self, check_interval_minutes: int = 15):
         """Run continuous monitoring loop"""

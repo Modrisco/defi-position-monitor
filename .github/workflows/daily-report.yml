@@ -1,0 +1,32 @@
+name: Daily Position Report
+
+on:
+  schedule:
+    # 8AM Sydney (AEDT/summer). In winter (AEST) this runs at 9AM Sydney.
+    - cron: '0 21 * * *'
+  workflow_dispatch:
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate daily report
+        env:
+          SUI_WALLET_ADDRESS: ${{ secrets.SUI_WALLET_ADDRESS }}
+          TELEGRAM_ALERT_BOT_TOKEN: ${{ secrets.TELEGRAM_ALERT_BOT_TOKEN }}
+          TELEGRAM_LOG_BOT_TOKEN: ${{ secrets.TELEGRAM_LOG_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python3 -m src.main report
