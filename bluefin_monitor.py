@@ -506,20 +506,18 @@ class BluefinMonitor:
         except Exception as e:
             print(f"Failed to send email: {e}")
     
-    async def send_telegram_alert(self, message: str):
-        """Send Telegram alert"""
-        bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-        chat_id = os.getenv("TELEGRAM_CHAT_ID")
-
+    async def send_telegram_message(self, message: str, bot_token: str, chat_id: str, silent: bool = False):
+        """Send Telegram message using specified bot"""
         if not bot_token or not chat_id:
             print("Telegram credentials not configured")
-            return
+            return False
 
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         payload = {
             "chat_id": chat_id,
             "text": message,
-            "parse_mode": "HTML"
+            "parse_mode": "HTML",
+            "disable_notification": silent
         }
 
         ssl_context = ssl.create_default_context(cafile=certifi.where())
@@ -528,14 +526,43 @@ class BluefinMonitor:
         async with aiohttp.ClientSession(connector=connector) as session:
             async with session.post(url, json=payload) as response:
                 if response.status == 200:
-                    print("Telegram alert sent")
+                    return True
                 else:
-                    print(f"Failed to send Telegram alert: {response.status}")
+                    print(f"Failed to send Telegram message: {response.status}")
+                    return False
+
+    async def send_telegram_alert(self, message: str):
+        """Send Telegram alert (critical notifications - unmuted bot)"""
+        bot_token = os.getenv("TELEGRAM_ALERT_BOT_TOKEN")
+        chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+        if await self.send_telegram_message(message, bot_token, chat_id, silent=False):
+            print("Telegram alert sent")
+
+    async def send_telegram_log(self, message: str, silent: bool = True):
+        """Send Telegram log message (logs bot - can be muted)"""
+        bot_token = os.getenv("TELEGRAM_LOG_BOT_TOKEN")
+        chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+        if await self.send_telegram_message(message, bot_token, chat_id, silent=silent):
+            print("Telegram log sent")
     
     async def check_and_alert(self):
-        """Check positions and send alerts if needed"""
+        """Check positions, send logs, and send alerts if needed"""
         positions = await self.check_positions()
-        
+
+        if not positions:
+            log_msg = f"""
+📊 <b>Bluefin Position Check</b>
+
+No active positions found.
+
+Wallet: <code>{self.wallet_address[:10]}...{self.wallet_address[-6:]}</code>
+Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC
+            """
+            await self.send_telegram_log(log_msg, silent=False)
+            return
+
         for position in positions:
             print(f"\nPosition Status:")
             print(f"  Collateral Value: ${position.collateral_value:.2f}")
@@ -543,11 +570,37 @@ class BluefinMonitor:
             print(f"  LTV: {position.ltv:.2f}%")
             print(f"  Health Factor: {position.health_factor:.2f}")
             print(f"  Liquidation Threshold: {position.liquidation_threshold:.2f}%")
-            
-            # Check for alerts
+
+            # Determine status
+            if position.ltv >= self.ltv_critical_threshold:
+                status = "🚨 CRITICAL"
+            elif position.ltv >= self.ltv_warning_threshold:
+                status = "⚠️ WARNING"
+            else:
+                status = "✅ Healthy"
+
+            # Always send log to logs bot
+            log_msg = f"""
+📊 <b>Bluefin Position Check</b>
+
+<b>Status:</b> {status}
+
+<b>Collateral:</b> ${position.collateral_value:,.2f}
+<b>Borrowed:</b> ${position.borrowed_value:,.2f}
+
+<b>LTV:</b> {position.ltv:.2f}%
+<b>Health Factor:</b> {position.health_factor:.2f}
+<b>Liquidation Threshold:</b> {position.liquidation_threshold:.2f}%
+
+Wallet: <code>{self.wallet_address[:10]}...{self.wallet_address[-6:]}</code>
+Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC
+            """
+            await self.send_telegram_log(log_msg, silent=False)
+
+            # Send alert to alert bot only when thresholds exceeded
             if position.ltv >= self.ltv_critical_threshold:
                 alert_msg = f"""
-🚨 CRITICAL ALERT: High LTV Ratio!
+🚨 <b>CRITICAL ALERT: High LTV Ratio!</b>
 
 Your Bluefin AlphaLend position has reached a critical LTV level:
 - Current LTV: {position.ltv:.2f}%
@@ -556,15 +609,15 @@ Your Bluefin AlphaLend position has reached a critical LTV level:
 
 ⚠️ ACTION REQUIRED: Add more collateral or repay debt immediately to avoid liquidation!
 
-Wallet: {self.wallet_address}
-Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Wallet: <code>{self.wallet_address[:10]}...{self.wallet_address[-6:]}</code>
+Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC
                 """
                 await self.send_email_alert("🚨 CRITICAL: Liquidation Risk!", alert_msg)
                 await self.send_telegram_alert(alert_msg)
-                
+
             elif position.ltv >= self.ltv_warning_threshold:
                 alert_msg = f"""
-⚠️ WARNING: Elevated LTV Ratio
+⚠️ <b>WARNING: Elevated LTV Ratio</b>
 
 Your Bluefin AlphaLend position LTV is getting high:
 - Current LTV: {position.ltv:.2f}%
@@ -573,12 +626,12 @@ Your Bluefin AlphaLend position LTV is getting high:
 
 Consider adding collateral or reducing your borrowed amount.
 
-Wallet: {self.wallet_address}
-Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Wallet: <code>{self.wallet_address[:10]}...{self.wallet_address[-6:]}</code>
+Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC
                 """
                 await self.send_email_alert("⚠️ WARNING: High LTV", alert_msg)
                 await self.send_telegram_alert(alert_msg)
-    
+
     async def generate_daily_report(self):
         """Generate daily position report"""
         positions = await self.check_positions()
@@ -650,7 +703,7 @@ async def main():
     import sys
     if len(sys.argv) > 1:
         if sys.argv[1] == "check":
-            # One-time check
+            # One-time check (sends log + alerts if needed)
             await monitor.check_and_alert()
         elif sys.argv[1] == "report":
             # Generate daily report
@@ -661,7 +714,7 @@ async def main():
             await monitor.run_continuous_monitoring(interval)
     else:
         print("Usage:")
-        print("  python bluefin_monitor.py check          - One-time position check")
+        print("  python bluefin_monitor.py check          - Check position (logs + alerts if needed)")
         print("  python bluefin_monitor.py report         - Generate daily report")
         print("  python bluefin_monitor.py monitor [mins] - Continuous monitoring")
 
