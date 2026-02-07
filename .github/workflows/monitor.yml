@@ -1,4 +1,4 @@
-name: Bluefin Position Monitor
+name: DeFi Position Monitor
 
 on:
   schedule:
@@ -30,4 +30,4 @@ jobs:
           TELEGRAM_ALERT_BOT_TOKEN: ${{ secrets.TELEGRAM_ALERT_BOT_TOKEN }}
           TELEGRAM_LOG_BOT_TOKEN: ${{ secrets.TELEGRAM_LOG_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python3 -m src.main check
+        run: python3 -m src check

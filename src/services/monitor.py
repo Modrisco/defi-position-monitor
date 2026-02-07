@@ -1,204 +1,308 @@
-"""Main monitoring orchestration service"""
-import asyncio
-from datetime import datetime
-from typing import List
+"""Generic monitoring orchestration — iterates wallets x protocols."""
+from __future__ import annotations
 
-from ..config import (
-    WALLET_ADDRESS,
-    LTV_WARNING_THRESHOLD,
-    LTV_CRITICAL_THRESHOLD,
-)
-from ..models import PositionData
-from ..rpc import SuiClient
-from ..notifications import TelegramNotifier, EmailNotifier
-from .price_service import PriceService
-from .position_service import PositionService
+import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import Any
+
+from ..config import AppConfig
+from ..chains.sui import SuiClient
+from ..interfaces.notifier import Notifier
+from ..interfaces.price_oracle import PriceOracle
+from ..interfaces.protocol_adapter import ProtocolAdapter
+from ..models import AssetDetail, PositionData
+from ..notifications import EmailNotifier, TelegramNotifier
+from ..oracles import PythOracle
+from ..protocols.alphalend import AlphaLendAdapter
+
+logger = logging.getLogger(__name__)
+
+# Registry of protocol adapter factories keyed by protocol name.
+_PROTOCOL_FACTORIES: dict[str, Any] = {
+    "alphalend": lambda client, cfg: AlphaLendAdapter(client, cfg),
+}
 
 
 class Monitor:
-    """Orchestrates position monitoring and alerting"""
+    """Orchestrates position monitoring and alerting across wallets and protocols."""
 
-    def __init__(
-        self,
-        wallet_address: str = None,
-        ltv_warning_threshold: float = None,
-        ltv_critical_threshold: float = None,
-    ):
-        self.wallet_address = wallet_address or WALLET_ADDRESS
-        self.ltv_warning_threshold = ltv_warning_threshold or LTV_WARNING_THRESHOLD
-        self.ltv_critical_threshold = ltv_critical_threshold or LTV_CRITICAL_THRESHOLD
+    def __init__(self, config: AppConfig) -> None:
+        self._config = config
+        self._thresholds = config.monitor.thresholds
 
-        # Initialize services
-        self.sui_client = SuiClient()
-        self.price_service = PriceService()
-        self.position_service = PositionService(self.sui_client)
-        self.telegram = TelegramNotifier()
-        self.email = EmailNotifier()
+        # Build chain clients
+        self._chain_clients: dict[str, SuiClient] = {}
+        for chain_name, chain_cfg in config.chains.items():
+            self._chain_clients[chain_name] = SuiClient(chain_cfg)
 
-    def _format_wallet(self) -> str:
-        """Format wallet address for display"""
-        return f"{self.wallet_address[:10]}...{self.wallet_address[-6:]}"
+        # Build protocol adapters
+        self._adapters: dict[str, ProtocolAdapter] = {}
+        for proto_name, proto_cfg in config.protocols.items():
+            chain_client = self._chain_clients[proto_cfg.chain]
+            factory = _PROTOCOL_FACTORIES.get(proto_name)
+            if factory:
+                self._adapters[proto_name] = factory(chain_client, proto_cfg)
+            else:
+                logger.warning("No adapter factory for protocol '%s'", proto_name)
+
+        # Build price oracle
+        self._oracle: PriceOracle = PythOracle(config.price_oracle.pyth)
+
+        # Build notifiers
+        self._notifiers: list[Notifier] = []
+        if config.notifications.telegram.enabled:
+            self._notifiers.append(
+                TelegramNotifier(config.notifications.telegram)
+            )
+        if config.notifications.email.enabled:
+            self._notifiers.append(EmailNotifier(config.notifications.email))
+
+    # ------------------------------------------------------------------
+    # Formatting helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_wallet(address: str) -> str:
+        if len(address) > 16:
+            return f"{address[:10]}...{address[-6:]}"
+        return address
 
     def _get_status(self, ltv: float) -> str:
-        """Get status emoji based on LTV"""
-        if ltv >= self.ltv_critical_threshold:
+        if ltv >= self._thresholds.ltv_critical:
             return "🚨 CRITICAL"
-        elif ltv >= self.ltv_warning_threshold:
+        if ltv >= self._thresholds.ltv_warning:
             return "⚠️ WARNING"
         return "✅ Healthy"
 
-    def _build_log_message(self, position: PositionData) -> str:
-        """Build log message for Telegram"""
+    @staticmethod
+    def _now_str() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    @staticmethod
+    def _asset_symbols(assets: tuple[AssetDetail, ...]) -> str:
+        """Return comma-separated asset symbols, e.g. 'USDC, XBTC'."""
+        return ", ".join(a.symbol for a in assets) if assets else "—"
+
+    def _build_log_message(
+        self,
+        position: PositionData,
+        wallet_label: str,
+        proto_name: str,
+        chain: str,
+    ) -> str:
         status = self._get_status(position.ltv)
-        return f"""
-📊 <b>Bluefin Position Check</b>
+        collateral_syms = self._asset_symbols(position.collateral_assets)
+        borrowed_syms = self._asset_symbols(position.borrowed_assets)
+        return (
+            f"📊 {wallet_label} · {proto_name} · {chain.upper()}\n"
+            f"\n"
+            f"{status}\n"
+            f"\n"
+            f"Collateral: {collateral_syms} — ${position.collateral_value:,.2f}\n"
+            f"Borrowed: {borrowed_syms} — ${position.borrowed_value:,.2f}\n"
+            f"LTV: {position.ltv:.2f}% · HF: {position.health_factor:.2f}\n"
+            f"\n"
+            f"{self._now_str()} UTC"
+        )
 
-<b>Status:</b> {status}
+    def _build_critical_alert(
+        self,
+        position: PositionData,
+        wallet_address: str,
+        wallet_label: str,
+        proto_name: str,
+        chain: str,
+    ) -> str:
+        collateral_syms = self._asset_symbols(position.collateral_assets)
+        borrowed_syms = self._asset_symbols(position.borrowed_assets)
+        return (
+            f"🚨 CRITICAL — LTV {position.ltv:.2f}%\n"
+            f"\n"
+            f"{wallet_label} · {proto_name} · {chain.upper()}\n"
+            f"\n"
+            f"Collateral: {collateral_syms}\n"
+            f"  ${position.collateral_value:,.2f}\n"
+            f"\n"
+            f"Borrowed: {borrowed_syms}\n"
+            f"  ${position.borrowed_value:,.2f}\n"
+            f"\n"
+            f"Health Factor: {position.health_factor:.2f}\n"
+            f"Liquidation Threshold: {position.liquidation_threshold:.2f}%\n"
+            f"\n"
+            f"⚠️ Add collateral or repay debt immediately!\n"
+            f"\n"
+            f"Wallet: {self._format_wallet(wallet_address)}\n"
+            f"{self._now_str()} UTC"
+        )
 
-<b>Collateral Assets:</b> {position.asset}
-<b>Collateral Value:</b> ${position.collateral_value:,.2f}
+    def _build_warning_alert(
+        self,
+        position: PositionData,
+        wallet_address: str,
+        wallet_label: str,
+        proto_name: str,
+        chain: str,
+    ) -> str:
+        collateral_syms = self._asset_symbols(position.collateral_assets)
+        borrowed_syms = self._asset_symbols(position.borrowed_assets)
+        return (
+            f"⚠️ WARNING — LTV {position.ltv:.2f}%\n"
+            f"\n"
+            f"{wallet_label} · {proto_name} · {chain.upper()}\n"
+            f"\n"
+            f"Collateral: {collateral_syms}\n"
+            f"  ${position.collateral_value:,.2f}\n"
+            f"\n"
+            f"Borrowed: {borrowed_syms}\n"
+            f"  ${position.borrowed_value:,.2f}\n"
+            f"\n"
+            f"Health Factor: {position.health_factor:.2f}\n"
+            f"Liquidation Threshold: {position.liquidation_threshold:.2f}%\n"
+            f"\n"
+            f"Consider adding collateral or reducing borrowed amount.\n"
+            f"\n"
+            f"Wallet: {self._format_wallet(wallet_address)}\n"
+            f"{self._now_str()} UTC"
+        )
 
-<b>Borrowed Assets:</b> {position.borrowed_asset}
-<b>Borrowed Value:</b> ${position.borrowed_value:,.2f}
+    # ------------------------------------------------------------------
+    # Notification dispatch
+    # ------------------------------------------------------------------
 
-<b>LTV:</b> {position.ltv:.2f}%
-<b>Health Factor:</b> {position.health_factor:.2f}
-<b>Liquidation Threshold:</b> {position.liquidation_threshold:.2f}%
+    async def _send_log(self, message: str, silent: bool = False) -> None:
+        for notifier in self._notifiers:
+            try:
+                await notifier.send_log(message, silent=silent)
+            except Exception as e:
+                logger.error("Notifier send_log failed: %s", e)
 
-Wallet: <code>{self._format_wallet()}</code>
-Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC
-        """
+    async def _send_alert(self, message: str, subject: str = "") -> None:
+        for notifier in self._notifiers:
+            try:
+                await notifier.send_alert(message, subject=subject)
+            except Exception as e:
+                logger.error("Notifier send_alert failed: %s", e)
 
-    def _build_critical_alert(self, position: PositionData) -> str:
-        """Build critical alert message"""
-        return f"""
-🚨 <b>CRITICAL ALERT: High LTV Ratio!</b>
+    # ------------------------------------------------------------------
+    # Core workflows
+    # ------------------------------------------------------------------
 
-<b>Collateral:</b> {position.asset}
-<b>Collateral Value:</b> ${position.collateral_value:,.2f}
+    async def check_and_alert(self) -> None:
+        """Check all wallet×protocol positions and send alerts when needed."""
+        prices = await self._oracle.fetch_prices()
 
-<b>Borrowed:</b> {position.borrowed_asset}
-<b>Borrowed Value:</b> ${position.borrowed_value:,.2f}
+        for wallet_cfg in self._config.wallets:
+            for proto_name in wallet_cfg.protocols:
+                adapter = self._adapters.get(proto_name)
+                if not adapter:
+                    continue
 
-<b>LTV:</b> {position.ltv:.2f}%
-<b>Health Factor:</b> {position.health_factor:.2f}
-<b>Liquidation Threshold:</b> {position.liquidation_threshold:.2f}%
+                positions = await adapter.fetch_positions(
+                    wallet_cfg.address, prices
+                )
 
-⚠️ ACTION REQUIRED: Add more collateral or repay debt immediately!
+                if not positions:
+                    log_msg = (
+                        f"📊 {wallet_cfg.label} · {proto_name} · {wallet_cfg.chain.upper()}\n"
+                        f"\n"
+                        f"No active positions found.\n"
+                        f"\n"
+                        f"{self._now_str()} UTC"
+                    )
+                    await self._send_log(log_msg, silent=False)
+                    continue
 
-Wallet: <code>{self._format_wallet()}</code>
-Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC
-        """
+                for position in positions:
+                    logger.info(
+                        "Position — %s · %s · Collateral: $%.2f  Borrowed: $%.2f  LTV: %.2f%%  HF: %.2f",
+                        wallet_cfg.label,
+                        proto_name,
+                        position.collateral_value,
+                        position.borrowed_value,
+                        position.ltv,
+                        position.health_factor,
+                    )
 
-    def _build_warning_alert(self, position: PositionData) -> str:
-        """Build warning alert message"""
-        return f"""
-⚠️ <b>WARNING: Elevated LTV Ratio</b>
+                    log_msg = self._build_log_message(
+                        position, wallet_cfg.label, proto_name, wallet_cfg.chain,
+                    )
+                    await self._send_log(log_msg, silent=False)
 
-<b>Collateral:</b> {position.asset}
-<b>Collateral Value:</b> ${position.collateral_value:,.2f}
+                    if position.ltv >= self._thresholds.ltv_critical:
+                        alert_msg = self._build_critical_alert(
+                            position, wallet_cfg.address,
+                            wallet_cfg.label, proto_name, wallet_cfg.chain,
+                        )
+                        await self._send_alert(
+                            alert_msg, subject="🚨 CRITICAL: Liquidation Risk!"
+                        )
+                    elif position.ltv >= self._thresholds.ltv_warning:
+                        alert_msg = self._build_warning_alert(
+                            position, wallet_cfg.address,
+                            wallet_cfg.label, proto_name, wallet_cfg.chain,
+                        )
+                        await self._send_alert(
+                            alert_msg, subject="⚠️ WARNING: High LTV"
+                        )
 
-<b>Borrowed:</b> {position.borrowed_asset}
-<b>Borrowed Value:</b> ${position.borrowed_value:,.2f}
+    async def generate_daily_report(self) -> None:
+        """Generate and send daily position report grouped by wallet → protocol."""
+        prices = await self._oracle.fetch_prices()
 
-<b>LTV:</b> {position.ltv:.2f}%
-<b>Health Factor:</b> {position.health_factor:.2f}
-<b>Liquidation Threshold:</b> {position.liquidation_threshold:.2f}%
+        sections: list[str] = []
+        has_positions = False
 
-Consider adding collateral or reducing your borrowed amount.
+        for wallet_cfg in self._config.wallets:
+            wallet_lines: list[str] = []
 
-Wallet: <code>{self._format_wallet()}</code>
-Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC
-        """
+            for proto_name in wallet_cfg.protocols:
+                adapter = self._adapters.get(proto_name)
+                if not adapter:
+                    continue
 
-    async def check_and_alert(self):
-        """Check positions, send logs, and send alerts if needed"""
-        # Fetch current prices from Pyth
-        prices = await self.price_service.fetch_prices()
+                positions = await adapter.fetch_positions(
+                    wallet_cfg.address, prices
+                )
 
-        # Fetch positions with real-time price calculation
-        positions = await self.position_service.fetch_positions(self.wallet_address, prices)
+                for position in positions:
+                    has_positions = True
+                    status = self._get_status(position.ltv)
+                    wallet_lines.append(
+                        f"{proto_name} · {status}\n"
+                        f"  Collateral: ${position.collateral_value:,.2f}\n"
+                        f"  Borrowed: ${position.borrowed_value:,.2f}\n"
+                        f"  LTV: {position.ltv:.2f}% · HF: {position.health_factor:.2f}"
+                    )
 
-        if not positions:
-            log_msg = f"""
-📊 <b>Bluefin Position Check</b>
+            if wallet_lines:
+                header = f"━━ {wallet_cfg.label} ({wallet_cfg.chain.upper()}) ━━"
+                sections.append(header + "\n\n" + "\n\n".join(wallet_lines))
 
-No active positions found.
+        body = "\n\n".join(sections) if sections else "No active positions found."
 
-Wallet: <code>{self._format_wallet()}</code>
-Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC
-            """
-            await self.telegram.send_log(log_msg, silent=False)
-            return
+        report = (
+            f"📋 Daily DeFi Position Report\n"
+            f"\n"
+            f"{body}\n"
+            f"\n"
+            f"{self._now_str()} UTC"
+        )
 
-        for position in positions:
-            print(f"\nPosition Status:")
-            print(f"  Collateral Value: ${position.collateral_value:.2f}")
-            print(f"  Borrowed Value: ${position.borrowed_value:.2f}")
-            print(f"  LTV: {position.ltv:.2f}%")
-            print(f"  Health Factor: {position.health_factor:.2f}")
-            print(f"  Liquidation Threshold: {position.liquidation_threshold:.2f}%")
+        await self._send_alert(report)
+        logger.info("Daily report sent")
 
-            # Always send log to logs bot
-            log_msg = self._build_log_message(position)
-            await self.telegram.send_log(log_msg, silent=False)
-
-            # Send alert only when thresholds exceeded
-            if position.ltv >= self.ltv_critical_threshold:
-                alert_msg = self._build_critical_alert(position)
-                await self.email.send_alert("🚨 CRITICAL: Liquidation Risk!", alert_msg)
-                await self.telegram.send_alert(alert_msg)
-
-            elif position.ltv >= self.ltv_warning_threshold:
-                alert_msg = self._build_warning_alert(position)
-                await self.email.send_alert("⚠️ WARNING: High LTV", alert_msg)
-                await self.telegram.send_alert(alert_msg)
-
-    async def generate_daily_report(self):
-        """Generate and send daily position report via Telegram alert bot"""
-        prices = await self.price_service.fetch_prices()
-        positions = await self.position_service.fetch_positions(self.wallet_address, prices)
-
-        if not positions:
-            report = f"""
-📋 <b>Daily Bluefin AlphaLend Report</b>
-
-No active positions found.
-
-Wallet: <code>{self._format_wallet()}</code>
-Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC
-            """
-        else:
-            position_lines = ""
-            for i, position in enumerate(positions, 1):
-                status = self._get_status(position.ltv)
-                position_lines += f"""
-<b>Position {i}:</b> {status}
-  Collateral: {position.asset} — ${position.collateral_value:,.2f}
-  Borrowed: {position.borrowed_asset} — ${position.borrowed_value:,.2f}
-  LTV: {position.ltv:.2f}%
-  Health Factor: {position.health_factor:.2f}
-  Liquidation Threshold: {position.liquidation_threshold:.2f}%
-"""
-
-            report = f"""
-📋 <b>Daily Bluefin AlphaLend Report</b>
-{position_lines}
-Wallet: <code>{self._format_wallet()}</code>
-Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC
-            """
-
-        await self.telegram.send_alert(report)
-        print(report)
-
-    async def run_continuous(self, check_interval_minutes: int = 15):
-        """Run continuous monitoring loop"""
-        print(f"Starting continuous monitoring (checking every {check_interval_minutes} minutes)")
+    async def run_continuous(self, check_interval_minutes: int | None = None) -> None:
+        """Run continuous monitoring loop."""
+        interval = check_interval_minutes or self._config.monitor.check_interval_minutes
+        logger.info(
+            "Starting continuous monitoring (checking every %d minutes)", interval
+        )
 
         while True:
             try:
                 await self.check_and_alert()
-                await asyncio.sleep(check_interval_minutes * 60)
+                await asyncio.sleep(interval * 60)
             except Exception as e:
-                print(f"Error in monitoring loop: {e}")
+                logger.error("Error in monitoring loop: %s", e)
                 await asyncio.sleep(60)

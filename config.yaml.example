@@ -1,0 +1,67 @@
+# DeFi Position Monitor — Configuration
+# Copy to config.yaml and set secrets in .env
+
+monitor:
+  check_interval_minutes: 15         # How often to check positions
+  thresholds:
+    ltv_warning: 70.0                # LTV % to trigger warning
+    ltv_critical: 80.0               # LTV % to trigger critical alert
+
+wallets:
+  - label: "main-wallet"             # Human-readable label
+    chain: sui                       # Which chain (must match a key in `chains`)
+    address: "${SUI_WALLET_ADDRESS}" # Interpolated from .env
+    protocols: [alphalend]           # Which protocols to check (must match keys in `protocols`)
+
+chains:
+  sui:
+    rpc_endpoints:                   # Tried in order; automatic fallback
+      - "https://fullnode.mainnet.sui.io:443"
+      - "https://sui-mainnet.nodeinfra.com"
+      - "https://sui-mainnet-endpoint.blockvision.org"
+    rpc_timeout: 30                  # Seconds per RPC call
+
+protocols:
+  alphalend:
+    chain: sui
+    contracts:
+      lending_protocol_id: "0x01d9..."
+      package_id: "0xd631..."
+      positions_table_id: "0x9923..."
+      markets_table_id: "0x2326..."
+    liquidation_threshold: 85.0
+    token_decimals:
+      SUI: 9
+      USDC: 6
+      USDT: 6
+      BTC: 8
+      XBTC: 8
+      ETH: 8
+      WETH: 8
+    token_aliases:
+      XBTC: BTC                      # Treat XBTC prices as BTC
+
+price_oracle:
+  provider: pyth                     # Currently only 'pyth' is supported
+  pyth:
+    hermes_url: "https://hermes.pyth.network/v2/updates/price/latest"
+    feeds:                           # Pyth price-feed hex IDs (without 0x prefix)
+      SUI: "23d7..."
+      BTC: "e62d..."
+      USDC: "eaa0..."
+      USDT: "2b89..."
+      ETH: "ff61..."
+
+notifications:
+  telegram:
+    enabled: true
+    alert_bot_token: "${TELEGRAM_ALERT_BOT_TOKEN}"
+    log_bot_token: "${TELEGRAM_LOG_BOT_TOKEN}"
+    chat_id: "${TELEGRAM_CHAT_ID}"
+  email:
+    enabled: false
+    alert_email: "${ALERT_EMAIL}"
+    smtp_server: "${SMTP_SERVER}"
+    smtp_port: 587
+    sender_email: "${SENDER_EMAIL}"
+    sender_password: "${SENDER_PASSWORD}"

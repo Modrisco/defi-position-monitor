@@ -1,43 +1,40 @@
-"""Email notification service"""
+"""Email notification service."""
+import logging
 import smtplib
-from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
-from ..config import (
-    ALERT_EMAIL,
-    SMTP_SERVER,
-    SMTP_PORT,
-    SENDER_EMAIL,
-    SENDER_PASSWORD,
-)
+from ..config import EmailConfig
+
+logger = logging.getLogger(__name__)
 
 
 class EmailNotifier:
-    """Send notifications via email"""
+    """Send notifications via email."""
 
-    def __init__(self):
-        self.alert_email = ALERT_EMAIL
-        self.smtp_server = SMTP_SERVER
-        self.smtp_port = SMTP_PORT
-        self.sender_email = SENDER_EMAIL
-        self.sender_password = SENDER_PASSWORD
+    def __init__(self, config: EmailConfig) -> None:
+        self.alert_email = config.alert_email
+        self.smtp_server = config.smtp_server
+        self.smtp_port = config.smtp_port
+        self.sender_email = config.sender_email
+        self.sender_password = config.sender_password
 
-    async def send_alert(self, subject: str, body: str) -> bool:
-        """Send email alert"""
+    async def send_alert(self, message: str, subject: str = "") -> bool:
+        """Send email alert."""
         if not self.alert_email:
-            print("No alert email configured, skipping email")
+            logger.debug("No alert email configured, skipping email")
             return False
 
         if not self.sender_email or not self.sender_password:
-            print("Email credentials not configured")
+            logger.warning("Email credentials not configured")
             return False
 
         msg = MIMEMultipart()
-        msg['From'] = self.sender_email
-        msg['To'] = self.alert_email
-        msg['Subject'] = subject
+        msg["From"] = self.sender_email
+        msg["To"] = self.alert_email
+        msg["Subject"] = subject
 
-        msg.attach(MIMEText(body, 'plain'))
+        msg.attach(MIMEText(message, "plain"))
 
         try:
             server = smtplib.SMTP(self.smtp_server, self.smtp_port)
@@ -45,8 +42,12 @@ class EmailNotifier:
             server.login(self.sender_email, self.sender_password)
             server.send_message(msg)
             server.quit()
-            print(f"Alert email sent to {self.alert_email}")
+            logger.info("Alert email sent to %s", self.alert_email)
             return True
         except Exception as e:
-            print(f"Failed to send email: {e}")
+            logger.error("Failed to send email: %s", e)
             return False
+
+    async def send_log(self, message: str, silent: bool = True) -> bool:
+        """Email notifier does not support log messages — no-op."""
+        return False
