@@ -9,7 +9,6 @@ env/
 .env.local
 .env.*.local
 *.env
-config.yaml
 
 # Security - certificates and databases
 *.pem
