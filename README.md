@@ -8,29 +8,59 @@ Currently supports:
 - **Price Oracle:** Pyth Network
 - **Notifications:** Telegram (dual-bot), Email (SMTP)
 
-## Quick Start
+## Run Locally
 
 ```bash
-# 1. Install dependencies
+# 1. Clone the repo
+git clone https://github.com/<your-username>/defi-position-monitor.git
+cd defi-position-monitor
+
+# 2. Install dependencies (Python 3.11+)
 pip install -r requirements.txt
 
-# 2. Copy and fill in secrets
+# 3. Copy and fill in your secrets
 cp .env.example .env
+# Edit .env — add your SUI wallet address(es), Telegram bot tokens, etc.
 
-# 3. Review / customise config
-#    (config.yaml is ready to use; secrets are interpolated from .env)
-cat config.yaml
+# 4. Copy the config template (or use config.yaml directly)
+cp config.yaml.example config.yaml
+# Edit config.yaml — adjust wallets, thresholds, and notification settings
 
-# 4. Run a single check
+# 5. Run a single health check
 python3 -m src check
 
-# 5. Generate a daily report
+# 6. Generate a daily report
 python3 -m src report
 
-# 6. Continuous monitoring
+# 7. Continuous monitoring (runs in foreground)
 python3 -m src monitor          # uses interval from config.yaml
 python3 -m src monitor 10       # override: check every 10 minutes
 ```
+
+## Fork & Deploy with GitHub Actions
+
+If you want automated monitoring without running a server, fork this repo and use GitHub Actions:
+
+1. **Fork** this repository to your own GitHub account.
+
+2. **Add secrets** in your fork: go to **Settings → Secrets and variables → Actions → New repository secret** and add:
+   | Secret | Description |
+   |--------|-------------|
+   | `SUI_WALLET_ADDRESS` | Your primary SUI wallet address |
+   | `SUI_WALLET_ADDRESS_2` | (Optional) Second SUI wallet address |
+   | `TELEGRAM_ALERT_BOT_TOKEN` | Telegram bot token for unmuted alerts |
+   | `TELEGRAM_LOG_BOT_TOKEN` | Telegram bot token for silent log messages |
+   | `TELEGRAM_CHAT_ID` | Telegram chat ID to receive notifications |
+
+3. **Enable Actions** in your fork: go to the **Actions** tab and click "I understand my workflows, go ahead and enable them".
+
+4. **Trigger a test run**: on the Actions tab, select either workflow and click **Run workflow** to verify everything works.
+
+Two workflows are included out of the box:
+- **DeFi Position Monitor** — runs `python3 -m src check` every 15 minutes
+- **Daily Position Report** — runs `python3 -m src report` daily at 8 AM Sydney time
+
+You can customise the schedule by editing the `cron` expressions in `.github/workflows/`.
 
 ## Configuration
 
@@ -79,7 +109,3 @@ pytest
 pytest --cov=src --cov-report=term-missing
 ```
 
-## GitHub Actions
-
-- **DeFi Position Monitor** — runs `python3 -m src check` every 15 minutes
-- **Daily Position Report** — runs `python3 -m src report` daily at 8 AM Sydney time

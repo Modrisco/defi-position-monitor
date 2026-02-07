@@ -84,28 +84,6 @@ class Monitor:
         """Return comma-separated asset symbols, e.g. 'USDC, XBTC'."""
         return ", ".join(a.symbol for a in assets) if assets else "—"
 
-    def _build_log_message(
-        self,
-        position: PositionData,
-        wallet_label: str,
-        proto_name: str,
-        chain: str,
-    ) -> str:
-        status = self._get_status(position.ltv)
-        collateral_syms = self._asset_symbols(position.collateral_assets)
-        borrowed_syms = self._asset_symbols(position.borrowed_assets)
-        return (
-            f"📊 {wallet_label} · {proto_name} · {chain.upper()}\n"
-            f"\n"
-            f"{status}\n"
-            f"\n"
-            f"Collateral: {collateral_syms} — ${position.collateral_value:,.2f}\n"
-            f"Borrowed: {borrowed_syms} — ${position.borrowed_value:,.2f}\n"
-            f"LTV: {position.ltv:.2f}% · HF: {position.health_factor:.2f}\n"
-            f"\n"
-            f"{self._now_str()} UTC"
-        )
-
     def _build_critical_alert(
         self,
         position: PositionData,
@@ -189,8 +167,11 @@ class Monitor:
     # ------------------------------------------------------------------
 
     async def check_and_alert(self) -> None:
-        """Check all wallet×protocol positions and send alerts when needed."""
+        """Check all wallet×protocol positions and send a single combined log."""
         prices = await self._oracle.fetch_prices()
+
+        sections: list[str] = []
+        alerts: list[tuple[str, str]] = []  # (message, subject)
 
         for wallet_cfg in self._config.wallets:
             for proto_name in wallet_cfg.protocols:
@@ -203,14 +184,10 @@ class Monitor:
                 )
 
                 if not positions:
-                    log_msg = (
+                    sections.append(
                         f"📊 {wallet_cfg.label} · {proto_name} · {wallet_cfg.chain.upper()}\n"
-                        f"\n"
-                        f"No active positions found.\n"
-                        f"\n"
-                        f"{self._now_str()} UTC"
+                        f"No active positions found."
                     )
-                    await self._send_log(log_msg, silent=False)
                     continue
 
                 for position in positions:
@@ -224,27 +201,38 @@ class Monitor:
                         position.health_factor,
                     )
 
-                    log_msg = self._build_log_message(
-                        position, wallet_cfg.label, proto_name, wallet_cfg.chain,
+                    status = self._get_status(position.ltv)
+                    collateral_syms = self._asset_symbols(position.collateral_assets)
+                    borrowed_syms = self._asset_symbols(position.borrowed_assets)
+                    sections.append(
+                        f"📊 {wallet_cfg.label} · {proto_name} · {wallet_cfg.chain.upper()}\n"
+                        f"{status}\n"
+                        f"Collateral: {collateral_syms} — ${position.collateral_value:,.2f}\n"
+                        f"Borrowed: {borrowed_syms} — ${position.borrowed_value:,.2f}\n"
+                        f"LTV: {position.ltv:.2f}% · HF: {position.health_factor:.2f}"
                     )
-                    await self._send_log(log_msg, silent=False)
 
                     if position.ltv >= self._thresholds.ltv_critical:
                         alert_msg = self._build_critical_alert(
                             position, wallet_cfg.address,
                             wallet_cfg.label, proto_name, wallet_cfg.chain,
                         )
-                        await self._send_alert(
-                            alert_msg, subject="🚨 CRITICAL: Liquidation Risk!"
-                        )
+                        alerts.append((alert_msg, "🚨 CRITICAL: Liquidation Risk!"))
                     elif position.ltv >= self._thresholds.ltv_warning:
                         alert_msg = self._build_warning_alert(
                             position, wallet_cfg.address,
                             wallet_cfg.label, proto_name, wallet_cfg.chain,
                         )
-                        await self._send_alert(
-                            alert_msg, subject="⚠️ WARNING: High LTV"
-                        )
+                        alerts.append((alert_msg, "⚠️ WARNING: High LTV"))
+
+        # Send one combined log message
+        if sections:
+            combined = "\n\n".join(sections) + f"\n\n{self._now_str()} UTC"
+            await self._send_log(combined, silent=False)
+
+        # Send alerts separately (urgent notifications)
+        for alert_msg, subject in alerts:
+            await self._send_alert(alert_msg, subject=subject)
 
     async def generate_daily_report(self) -> None:
         """Generate and send daily position report grouped by wallet → protocol."""

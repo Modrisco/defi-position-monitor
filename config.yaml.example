@@ -12,6 +12,10 @@ wallets:
     chain: sui                       # Which chain (must match a key in `chains`)
     address: "${SUI_WALLET_ADDRESS}" # Interpolated from .env
     protocols: [alphalend]           # Which protocols to check (must match keys in `protocols`)
+  - label: "wallet-2"
+    chain: sui
+    address: "${SUI_WALLET_ADDRESS_2}"
+    protocols: [alphalend]
 
 chains:
   sui:
